@@ -843,7 +843,7 @@ void usage()
     return ;  //Exit program here.
 }
 
-void main(int argc, char *argv[])
+int main(int argc, char *argv[])
 {
     unsigned short int x_speed;
 
@@ -877,10 +877,12 @@ void main(int argc, char *argv[])
         }
 
         free(data_buf);
+
+	return 0;
     }
     else
     {
         usage();
-        return ;  //Exit program here.
+        return -1;  //Exit program here.
     }
 }
