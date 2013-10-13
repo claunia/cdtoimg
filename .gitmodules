@@ -1,0 +1,3 @@
+[submodule "libcdio"]
+	path = libcdio
+	url = git://git.sv.gnu.org/libcdio.git
