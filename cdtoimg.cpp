@@ -1,10 +1,15 @@
 /*
-CDToImg v1.01.
-22 Oct 2006.
+CDToImg v1.02.
+13 Oct 2013.
 Written by Truman.
 
-Language and type: MS Visual Studio .NET 2002, Visual C++ v7, mixed C and C++,
-Application type : Win32 console.
+Modified by Natalia Portillo <natalia@claunia.com>
+
+Was language and type: MS Visual Studio .NET 2002, Visual C++ v7, mixed C and C++,
+Is: GNU Compiller Collection, mixed C and C++
+Was application type : Win32 console.
+Is: UNIX console
+Will be: Win32 console (MinGW or Visual C++ yet to see)
 
 A program that reads an entire CD-ROM (mode 1 or mode 2 form 1) 2048 bytes per
 sector and writes to a file - this would be an .ISO file. The CD must be CD-ROM
@@ -22,164 +27,87 @@ As always I do not take any responsibilities if this tool destroys your drive or
 even anything else.
 
 This code uses:
-- Win32 IOCTL function with SCSI_PASS_THROUGH_DIRECT.
+- libcdio as to cross-platform-esque send MMC commands to CD/DVD/BD drives.
 - The SCSI codes used in this source were taken from the draft documents MMC1,
   SPC1 and SAM1.
 - MMC1 Read CD command (0xBE, CDB 12) to read sectors (2048 user bytes mode).
 - Determine errors, retrieve and decode a few sense data.
 
-Normally you need the ntddscsi.h file from Microsoft DDK CD, but I shouldn't
-distribute it, so instead I have written my own my_ntddscsi.h.
-
-If you don't have windows.h some of the define constants are listed as comments.
-
-This is a Win32 console program and only runs in a DOS prompt under Windows
-NT4/2K/XP/2003 with appropriate user rights, i.e. you need to log in as
-administrator.
-
 Read readme.txt for more info.
 */
 
-#include <windows.h>
 #include <stdio.h>
 #include <malloc.h>
-#include "my_ntddscsi.h"
-#include "sam.h"
 #include "FloatUtils.h"
 
+// CDIO
+#include <cdio/cdio.h>
+#include <cdio/mmc.h>
+
+#include <string.h> // For memset()
+#include <stdlib.h> // For atoi()
+
 //Global variables..
-T_SPDT_SBUF sptd_sb;  //Includes sense buffer
 unsigned char *data_buf;  //Buffer for holding transfer data from or to drive.
 
-/*
-    1. Check the drive type to see if it's identified as a CDROM drive
-
-    2. Uses Win32 CreateFile function to get a handle to a drive
-       that is specified by cDriveLetter.
-
-   If you don't have windows.h, some of the define constants are
-   listed as comments.
-*/
-HANDLE open_volume(char drive_letter)
+// Opens device using libcdio
+CdIo_t *open_volume(char *drive_letter)
 {
-    HANDLE hVolume;
-    UINT uDriveType;
-    char szVolumeName[8];
-    char szRootName[5];
-    
-    //Make drive_letter as a null terminated string in the form of e.g.: d:\.
-    szRootName[0]=drive_letter;
-    szRootName[1]=':';
-    szRootName[2]='\\';
-    szRootName[3]='\0';
-
-    uDriveType = GetDriveType(szRootName);
-
-    //#define GENERIC_READ 0x80000000L
-    //#define GENERIC_WRITE 0x40000000L
-    switch(uDriveType)
-    {
-        case DRIVE_CDROM:
-        {
-            printf("Drive type is recognised as CDROM/DVD.\n");
-            break;
-        }
-        default:
-        {
-            printf("Drive type is not CDROM/DVD, aborting.\n");
-            return INVALID_HANDLE_VALUE;  //#define INVALID_HANDLE_VALUE (long int *)-1
-        }
-    }
-
-    //Make drive_letter as a null terminated string in the form of e.g.: \\.\d:.
-    szVolumeName[0]='\\';
-    szVolumeName[1]='\\';
-    szVolumeName[2]='.';
-    szVolumeName[3]='\\';
-    szVolumeName[4]=drive_letter;
-    szVolumeName[5]=':';
-    szVolumeName[6]='\0';
-
-    //#define FILE_SHARE_READ 0x00000001
-    //#define FILE_SHARE_WRITE 0x00000002
-    //#define OPEN_EXISTING 3
-    //#define FILE_ATTRIBUTE_NORMAL 0x00000080
-    //This will only work for CD/DVD device on W2K and higher.
-    hVolume = CreateFile(szVolumeName,
-                         GENERIC_READ | GENERIC_WRITE,
-                         FILE_SHARE_READ | FILE_SHARE_WRITE,
-                         NULL,
-                         OPEN_EXISTING,
-                         FILE_ATTRIBUTE_NORMAL,
-                         NULL);
-
-    if(hVolume == INVALID_HANDLE_VALUE)
-    {
-        //Try again for NT4..
-        hVolume = CreateFile(szVolumeName,
-                             GENERIC_READ,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE,
-                             NULL,
-                             OPEN_EXISTING,
-                             FILE_ATTRIBUTE_NORMAL,
-                             NULL);
-
-        if(hVolume == INVALID_HANDLE_VALUE)
-        {
-            printf("Could not create handle for CD/DVD device.\n");
-        }
-    }
-
-    return hVolume;
+	return cdio_open (drive_letter, DRIVER_DEVICE);
 }
 
 /* Displays sense error information. */
-void disp_sense()
+void disp_sense(CdIo_t *p_cdio)
 {
-    unsigned char key;
-    unsigned char ASC;
-    unsigned char ASCQ;
-
-    key=sptd_sb.SenseBuf[2] & 0x0F;  //Sense key is only the lower 4 bits
-    ASC=sptd_sb.SenseBuf[12];
-    ASCQ=sptd_sb.SenseBuf[13];
-
-    printf("Sense data, key:ASC:ASCQ: %02X:%02X:%02X", key, ASC, ASCQ);
-
-    //Decode sense key:ASC:ASCQ.
-    //It's a very short list - I'm just trying to show you how to decode into text.
-    //You really need to look into MMC document and change this into an exhaustive list from
-    //the sense error table that is found in there.
-    if(key==SEN_KEY_NO_SEN)
-    {
-        if(ASC==0x00)
-        {
-            if(ASCQ==0x00)
-            {
-                printf(" - No additional sense info.");  //No errors
-            }
-        }
-    }
+    cdio_mmc_request_sense_t *pp_sense;
+    
+    int cmd_ret;
+    
+    cmd_ret =  mmc_last_cmd_sense(p_cdio, &pp_sense);
+    
+    if(cmd_ret < 0)
+    	printf(" - Error reading last MMC sense.");
+    else if(cmd_ret == 0)
+    	printf(" - No additional sense info.");
     else
-    if(key==SEN_KEY_NOT_READY)
     {
-        if(ASC==0x3A)
-        {
-            if(ASCQ==0x00)
-            {
-                printf(" - Medium not present.");
-            }
-            else
-            if(ASCQ==0x01)
-            {
-                printf(" - Medium not present-tray closed.");
-            }
-            else
-            if(ASCQ==0x02)
-            {
-                printf(" - Medium not present-tray open.");
-            }
-        }
+	    printf("Sense data, key:ASC:ASCQ: %02X:%02X:%02X", pp_sense->sense_key, pp_sense->asc, pp_sense->ascq);
+
+	    //Decode sense key:ASC:ASCQ.
+	    //It's a very short list - I'm just trying to show you how to decode into text.
+	    //You really need to look into MMC document and change this into an exhaustive list from
+	    //the sense error table that is found in there.
+	    if(pp_sense->sense_key==CDIO_MMC_SENSE_KEY_NO_SENSE)
+	    {
+	        if(pp_sense->asc==0x00)
+	        {
+	            if(pp_sense->ascq==0x00)
+	            {
+	                printf(" - No additional sense info.");  //No errors
+	            }
+	        }
+	    }
+	    else
+	    if(pp_sense->sense_key==CDIO_MMC_SENSE_KEY_NOT_READY)
+	    {
+    	    if(pp_sense->asc==0x3A)
+	        {
+        	    if(pp_sense->ascq==0x00)
+            	{
+    	            printf(" - Medium not present.");
+	            }
+            	else
+        	    if(pp_sense->ascq==0x01)
+    	        {
+	                printf(" - Medium not present-tray closed.");
+            	}
+        	    else
+    	        if(pp_sense->ascq==0x02)
+	            {
+            	    printf(" - Medium not present-tray open.");
+        	    }
+    	    }
+	    }
     }
     
     printf("\n");
@@ -190,50 +118,30 @@ void disp_sense()
     2. Set up the CDB for SPC1 test unit ready command.
     3. Send the request to the drive.
 */
-BOOL test_unit_ready(HANDLE hVolume)
+driver_return_code_t test_unit_ready(CdIo_t *p_cdio)
 {
-    DWORD dwBytesReturned;
-
-    sptd_sb.sptd.Length=sizeof(SCSI_PASS_THROUGH_DIRECT);
-    sptd_sb.sptd.PathId=0;    //SCSI card ID will be filled in automatically.
-    sptd_sb.sptd.TargetId=0;  //SCSI target ID will also be filled in.
-    sptd_sb.sptd.Lun=0;       //SCSI lun ID will also be filled in.
-    sptd_sb.sptd.CdbLength=6;  //CDB size.
-    sptd_sb.sptd.SenseInfoLength=MAX_SENSE_LEN;  //Maximum length of sense data to retrieve.
-    sptd_sb.sptd.DataIn=SCSI_IOCTL_DATA_UNSPECIFIED; //There will be no buffer data to/from drive.
-    sptd_sb.sptd.DataTransferLength=0;  //Size of buffer transfer data.
-    sptd_sb.sptd.TimeOutValue=108000;  //SCSI timeout value (max 108000 sec = time 30 min).
-    sptd_sb.sptd.DataBuffer=(PVOID)data_buf;
-    sptd_sb.sptd.SenseInfoOffset=sizeof(SCSI_PASS_THROUGH_DIRECT);
+    mmc_cdb_t cdb = {{0, }};
 
     //CDB with values for Test Unit Ready CDB6 command.
     //The values were taken from SPC1 draft paper.
-    sptd_sb.sptd.Cdb[0]=0x00;  //Code for Test Unit Ready CDB6 command.
-    sptd_sb.sptd.Cdb[1]=0;
-    sptd_sb.sptd.Cdb[2]=0;
-    sptd_sb.sptd.Cdb[3]=0;
-    sptd_sb.sptd.Cdb[4]=0;
-    sptd_sb.sptd.Cdb[5]=0;
-    sptd_sb.sptd.Cdb[6]=0;
-    sptd_sb.sptd.Cdb[7]=0;
-    sptd_sb.sptd.Cdb[8]=0;
-    sptd_sb.sptd.Cdb[9]=0;
-    sptd_sb.sptd.Cdb[10]=0;
-    sptd_sb.sptd.Cdb[11]=0;
-    sptd_sb.sptd.Cdb[12]=0;
-    sptd_sb.sptd.Cdb[13]=0;
-    sptd_sb.sptd.Cdb[14]=0;
-    sptd_sb.sptd.Cdb[15]=0;
+    cdb.field[0]=0x00;  //Code for Test Unit Ready CDB6 command.
+    cdb.field[1]=0;
+    cdb.field[2]=0;
+    cdb.field[3]=0;
+    cdb.field[4]=0;
+    cdb.field[5]=0;
+    cdb.field[6]=0;
+    cdb.field[7]=0;
+    cdb.field[8]=0;
+    cdb.field[9]=0;
+    cdb.field[10]=0;
+    cdb.field[11]=0;
+    cdb.field[12]=0;
+    cdb.field[13]=0;
+    cdb.field[14]=0;
+    cdb.field[15]=0;
 
-    ZeroMemory(sptd_sb.SenseBuf, MAX_SENSE_LEN);
-
-    //Send the command to drive.
-    return DeviceIoControl(hVolume,
-                           IOCTL_SCSI_PASS_THROUGH_DIRECT,
-                           (PVOID)&sptd_sb, (DWORD)sizeof(sptd_sb),
-                           (PVOID)&sptd_sb, (DWORD)sizeof(sptd_sb),
-                           &dwBytesReturned,
-                           NULL);
+	return mmc_run_cmd(p_cdio, 108000000, &cdb, SCSI_MMC_DATA_NONE, 0, NULL);
 }
 
 /*
@@ -241,52 +149,33 @@ BOOL test_unit_ready(HANDLE hVolume)
     2. Set up the CDB for MMC1 set CD speed command.
     3. Send the request to the drive.
 */
-BOOL set_cd_speed(HANDLE hVolume,
+// claunia: There is a direct libcdio command for this, should we use it?
+driver_return_code_t set_cd_speed(CdIo_t *p_cdio,
                   unsigned short int in_read_speed,
                   unsigned short int in_write_speed)
 {
-    DWORD dwBytesReturned;
-
-    sptd_sb.sptd.Length=sizeof(SCSI_PASS_THROUGH_DIRECT);
-    sptd_sb.sptd.PathId=0;    //SCSI card ID will be filled in automatically.
-    sptd_sb.sptd.TargetId=0;  //SCSI target ID will also be filled in.
-    sptd_sb.sptd.Lun=0;       //SCSI lun ID will also be filled in.
-    sptd_sb.sptd.CdbLength=12;  //CDB size
-    sptd_sb.sptd.SenseInfoLength=MAX_SENSE_LEN;  //Return sense buffer length.
-    sptd_sb.sptd.DataIn=SCSI_IOCTL_DATA_UNSPECIFIED; //There will be no buffer data to/from drive.
-    sptd_sb.sptd.DataTransferLength=0;  //Size of buffer transfer data.
-    sptd_sb.sptd.TimeOutValue=108000;  //SCSI timeout value (max 108000 sec = time 30 min).
-    sptd_sb.sptd.DataBuffer=(PVOID)data_buf;
-    sptd_sb.sptd.SenseInfoOffset=sizeof(SCSI_PASS_THROUGH_DIRECT);
+    mmc_cdb_t cdb = {{0, }};
 
     //CDB with values for set cd speed command.
     //The values were taken from MMC1 draft paper.
-    sptd_sb.sptd.Cdb[0]=0xBB;  //Code for set cd speed command.
-    sptd_sb.sptd.Cdb[1]=0;
-    sptd_sb.sptd.Cdb[2]=(unsigned char)(in_read_speed>>8);
-    sptd_sb.sptd.Cdb[3]=(unsigned char)in_read_speed;
-    sptd_sb.sptd.Cdb[4]=(unsigned char)(in_write_speed>>8);
-    sptd_sb.sptd.Cdb[5]=(unsigned char)in_write_speed;
-    sptd_sb.sptd.Cdb[6]=0;
-    sptd_sb.sptd.Cdb[7]=0;
-    sptd_sb.sptd.Cdb[8]=0;
-    sptd_sb.sptd.Cdb[9]=0;
-    sptd_sb.sptd.Cdb[10]=0;
-    sptd_sb.sptd.Cdb[11]=0;
-    sptd_sb.sptd.Cdb[12]=0;
-    sptd_sb.sptd.Cdb[13]=0;
-    sptd_sb.sptd.Cdb[14]=0;
-    sptd_sb.sptd.Cdb[15]=0;
+    cdb.field[0]=0xBB;  //Code for set cd speed command.
+    cdb.field[1]=0;
+    cdb.field[2]=(unsigned char)(in_read_speed>>8);
+    cdb.field[3]=(unsigned char)in_read_speed;
+    cdb.field[4]=(unsigned char)(in_write_speed>>8);
+    cdb.field[5]=(unsigned char)in_write_speed;
+    cdb.field[6]=0;
+    cdb.field[7]=0;
+    cdb.field[8]=0;
+    cdb.field[9]=0;
+    cdb.field[10]=0;
+    cdb.field[11]=0;
+    cdb.field[12]=0;
+    cdb.field[13]=0;
+    cdb.field[14]=0;
+    cdb.field[15]=0;
 
-    ZeroMemory(sptd_sb.SenseBuf, MAX_SENSE_LEN);
-
-    //Send the command to drive
-    return DeviceIoControl(hVolume,
-                           IOCTL_SCSI_PASS_THROUGH_DIRECT,
-                           (PVOID)&sptd_sb, (DWORD)sizeof(sptd_sb),
-                           (PVOID)&sptd_sb, (DWORD)sizeof(sptd_sb),
-                           &dwBytesReturned,
-                           NULL);
+	return mmc_run_cmd(p_cdio, 108000000, &cdb, SCSI_MMC_DATA_NONE, 0, NULL);
 }
 
 /*
@@ -294,54 +183,35 @@ BOOL set_cd_speed(HANDLE hVolume,
     2. Set up the CDB for MMC1 read TOC/PMA/ATIP command.
     3. Send the request to the drive.
 */
-BOOL read_TOC_PMA_ATIP(HANDLE hVolume,
+driver_return_code_t read_TOC_PMA_ATIP(CdIo_t *p_cdio,
                        unsigned char in_format,
                        unsigned char in_trk_sess_no,
                        unsigned short int in_data_trans_len)
 {
-    DWORD dwBytesReturned;
-
-    sptd_sb.sptd.Length=sizeof(SCSI_PASS_THROUGH_DIRECT);
-    sptd_sb.sptd.PathId=0;    //SCSI card ID will be filled in automatically.
-    sptd_sb.sptd.TargetId=0;  //SCSI target ID will also be filled in.
-    sptd_sb.sptd.Lun=0;       //SCSI lun ID will also be filled in.
-    sptd_sb.sptd.CdbLength=10;  //CDB size.
-    sptd_sb.sptd.SenseInfoLength=MAX_SENSE_LEN;  //Maximum length of sense data to retrieve.
-    sptd_sb.sptd.DataIn=SCSI_IOCTL_DATA_IN;  //There will be data from drive.
-    sptd_sb.sptd.DataTransferLength=in_data_trans_len;  //Size of input data from drive.
-    sptd_sb.sptd.TimeOutValue=108000;  //SCSI timeout value (max 108000 sec = time 30 min).
-    sptd_sb.sptd.DataBuffer=(PVOID)data_buf;
-    sptd_sb.sptd.SenseInfoOffset=sizeof(SCSI_PASS_THROUGH_DIRECT);
+    mmc_cdb_t cdb = {{0, }};
 
     //CDB with values for READ TOC/PMA/ATIP CDB10 command.
     //The values were taken from MMC draft paper.
-    sptd_sb.sptd.Cdb[0]=0x43;  //Code for READ TOC/PMA/ATIP CDB10 command.
-    sptd_sb.sptd.Cdb[1]=0;
-    sptd_sb.sptd.Cdb[2]=in_format;  //Format code.
-    sptd_sb.sptd.Cdb[3]=0;
-    sptd_sb.sptd.Cdb[4]=0;
-    sptd_sb.sptd.Cdb[5]=0;
-    sptd_sb.sptd.Cdb[6]=in_trk_sess_no;
-    sptd_sb.sptd.Cdb[7]=(unsigned char)(in_data_trans_len >> 8);  //MSB of max length of bytes to receive.
-    sptd_sb.sptd.Cdb[8]=(unsigned char)in_data_trans_len;  //LSB of max length of bytes to receive.
-    sptd_sb.sptd.Cdb[9]=0;
-    sptd_sb.sptd.Cdb[10]=0;
-    sptd_sb.sptd.Cdb[11]=0;
-    sptd_sb.sptd.Cdb[12]=0;
-    sptd_sb.sptd.Cdb[13]=0;
-    sptd_sb.sptd.Cdb[14]=0;
-    sptd_sb.sptd.Cdb[15]=0;
+    cdb.field[0]=0x43;  //Code for READ TOC/PMA/ATIP CDB10 command.
+    cdb.field[1]=0;
+    cdb.field[2]=in_format;  //Format code.
+    cdb.field[3]=0;
+    cdb.field[4]=0;
+    cdb.field[5]=0;
+    cdb.field[6]=in_trk_sess_no;
+    cdb.field[7]=(unsigned char)(in_data_trans_len >> 8);  //MSB of max length of bytes to receive.
+    cdb.field[8]=(unsigned char)in_data_trans_len;  //LSB of max length of bytes to receive.
+    cdb.field[9]=0;
+    cdb.field[10]=0;
+    cdb.field[11]=0;
+    cdb.field[12]=0;
+    cdb.field[13]=0;
+    cdb.field[14]=0;
+    cdb.field[15]=0;
 
-    ZeroMemory(data_buf, in_data_trans_len);
-    ZeroMemory(sptd_sb.SenseBuf, MAX_SENSE_LEN);
+    memset(data_buf, 0, in_data_trans_len);
 
-    //Send the command to drive.
-    return DeviceIoControl(hVolume,
-                           IOCTL_SCSI_PASS_THROUGH_DIRECT,
-                           (PVOID)&sptd_sb, (DWORD)sizeof(sptd_sb),
-                           (PVOID)&sptd_sb, (DWORD)sizeof(sptd_sb),
-                           &dwBytesReturned,
-                           NULL);
+	return mmc_run_cmd(p_cdio, 108000000, &cdb, SCSI_MMC_DATA_READ, in_data_trans_len, (void *)data_buf);
 }
 
 /*
@@ -349,65 +219,46 @@ BOOL read_TOC_PMA_ATIP(HANDLE hVolume,
     2. Set up the CDB for MMC1 read CD (0xBE, CDB12) command.
     3. Send the request to the drive.
 */
-BOOL read_cd_2048(HANDLE hVolume,
+driver_return_code_t read_cd_2048(CdIo_t *p_cdio,
                   long int MMC_LBA_sector,
                   unsigned long int n_sectors,
                   unsigned char subch_sel_bits)
 {
-    DWORD dwBytesReturned;
+    mmc_cdb_t cdb = {{0, }};
     long int MMC_LBA_sector2;
     unsigned long int n_sectors2;
 
-    sptd_sb.sptd.Length=sizeof(SCSI_PASS_THROUGH_DIRECT);
-    sptd_sb.sptd.PathId=0;    //SCSI card ID will be filled in automatically.
-    sptd_sb.sptd.TargetId=0;  //SCSI target ID will also be filled in.
-    sptd_sb.sptd.Lun=0;       //SCSI lun ID will also be filled in.
-    sptd_sb.sptd.CdbLength=12;  //CDB size.
-    sptd_sb.sptd.SenseInfoLength=MAX_SENSE_LEN;  //Maximum length of sense data to retrieve.
-    sptd_sb.sptd.DataIn=SCSI_IOCTL_DATA_IN;  //There will be data coming from the drive.
-    sptd_sb.sptd.DataTransferLength=2048*n_sectors;  //Size of read data.
-    sptd_sb.sptd.TimeOutValue=108000;  //SCSI timeout value (max 108000 sec = time 30 min).
-    sptd_sb.sptd.DataBuffer=(PVOID)data_buf;
-    sptd_sb.sptd.SenseInfoOffset=sizeof(SCSI_PASS_THROUGH_DIRECT);
-
     //CDB with values for Read CD command.  The values were taken from MMC1 draft paper.
-    sptd_sb.sptd.Cdb[0]=0xBE;  //Code for Read CD command.
-    sptd_sb.sptd.Cdb[1]=0;
+    cdb.field[0]=0xBE;  //Code for Read CD command.
+    cdb.field[1]=0;
     
     //Fill in starting MMC sector (CDB[2] to CDB[5])..
-    sptd_sb.sptd.Cdb[5]=(unsigned char)MMC_LBA_sector;   //Least sig byte of LBA sector no. to read from CD.
+    cdb.field[5]=(unsigned char)MMC_LBA_sector;   //Least sig byte of LBA sector no. to read from CD.
     MMC_LBA_sector2=MMC_LBA_sector>>8;
-    sptd_sb.sptd.Cdb[4]=(unsigned char)MMC_LBA_sector2;  //2nd byte.
+    cdb.field[4]=(unsigned char)MMC_LBA_sector2;  //2nd byte.
     MMC_LBA_sector2=MMC_LBA_sector2>>8;
-    sptd_sb.sptd.Cdb[3]=(unsigned char)MMC_LBA_sector2;  //3rd byte.
+    cdb.field[3]=(unsigned char)MMC_LBA_sector2;  //3rd byte.
     MMC_LBA_sector2=MMC_LBA_sector2>>8;
-    sptd_sb.sptd.Cdb[2]=(unsigned char)MMC_LBA_sector2;  //Most significant byte.
+    cdb.field[2]=(unsigned char)MMC_LBA_sector2;  //Most significant byte.
 
     //Fill in no. of sectors to read (CDB[6] to CDB[8])..
-    sptd_sb.sptd.Cdb[8]=(unsigned char)n_sectors;  //No. of sectors to read from CD byte 0 (LSB).
+    cdb.field[8]=(unsigned char)n_sectors;  //No. of sectors to read from CD byte 0 (LSB).
     n_sectors2=n_sectors>>8;
-    sptd_sb.sptd.Cdb[7]=(unsigned char)n_sectors2;  //No. of sectors to read from CD byte 1.
+    cdb.field[7]=(unsigned char)n_sectors2;  //No. of sectors to read from CD byte 1.
     n_sectors2=n_sectors2>>8;
-    sptd_sb.sptd.Cdb[6]=(unsigned char)n_sectors2;  //No. of sectors to read from CD byte 2 (MSB).
+    cdb.field[6]=(unsigned char)n_sectors2;  //No. of sectors to read from CD byte 2 (MSB).
 
-    sptd_sb.sptd.Cdb[9]=0x10;  //Read user data only, 2048 bytes per sector from CDROM.
-    sptd_sb.sptd.Cdb[10]=subch_sel_bits;  //Sub-channel selection bits.
-    sptd_sb.sptd.Cdb[11]=0;
-    sptd_sb.sptd.Cdb[12]=0;
-    sptd_sb.sptd.Cdb[13]=0;
-    sptd_sb.sptd.Cdb[14]=0;
-    sptd_sb.sptd.Cdb[15]=0;
+    cdb.field[9]=0x10;  //Read user data only, 2048 bytes per sector from CDROM.
+    cdb.field[10]=subch_sel_bits;  //Sub-channel selection bits.
+    cdb.field[11]=0;
+    cdb.field[12]=0;
+    cdb.field[13]=0;
+    cdb.field[14]=0;
+    cdb.field[15]=0;
 
-    ZeroMemory(data_buf, 2048*n_sectors);
-    ZeroMemory(sptd_sb.SenseBuf, MAX_SENSE_LEN);
+    memset(data_buf, 0, 2048*n_sectors);
 
-    //Send the command to drive.
-    return DeviceIoControl(hVolume,
-                           IOCTL_SCSI_PASS_THROUGH_DIRECT,
-                           (PVOID)&sptd_sb, (DWORD)sizeof(sptd_sb),
-                           (PVOID)&sptd_sb, (DWORD)sizeof(sptd_sb),
-                           &dwBytesReturned,
-                           NULL);        
+	return mmc_run_cmd(p_cdio, 108000000, &cdb, SCSI_MMC_DATA_READ, 2048*n_sectors, (void *)data_buf);    
 }
 
 /*
@@ -440,11 +291,11 @@ unsigned short int x_2_kbytes_speed(unsigned short int x_speed)
     return RoundDouble(x_speed*176.4, 0);
 }
 
-BOOL verified_set_cd_speed(HANDLE hVolume,
+driver_return_code_t verified_set_cd_speed(CdIo_t *p_cdio,
                            unsigned short int in_read_speed,
                            unsigned short int in_write_speed)
 {
-    BOOL success;
+    driver_return_code_t success;
 
     printf("Sending MMC1 CD speed command ");
     if(in_read_speed==0xFFFF)
@@ -465,74 +316,56 @@ BOOL verified_set_cd_speed(HANDLE hVolume,
     }
 
     //Sends MMC1 set CD speed command to drive.
-    success=set_cd_speed(hVolume, in_read_speed, in_write_speed);
-    if(success)
+    success=set_cd_speed(p_cdio, in_read_speed, in_write_speed);
+    printf("done.\n");
+    if(success==DRIVER_OP_SUCCESS)
     {
-        printf("done.\n");
-        if(sptd_sb.sptd.ScsiStatus==STATUS_GOOD)
-        {
-            //Do nothing.
-        }
-        else
-        {
-            success=FALSE;
-            if(sptd_sb.sptd.ScsiStatus==STATUS_CHKCOND)
-            {
-                disp_sense();
-            }
-            else
-            {
-                printf("Command sent but returned with an unhandled status code: %02X\n", sptd_sb.sptd.ScsiStatus);
-            }
-        }
+        //Do nothing.
     }
     else
     {
-        printf("failed.\n");
-        printf("DeviceIOControl returned with failed status.\n");
+        if(success==DRIVER_OP_MMC_SENSE_DATA)
+        {
+            disp_sense(p_cdio);
+        }
+        else
+        {
+            printf("Command sent but returned with an unhandled status code: %02X\n", success);
+        }
     }
 
     return success;
 }
 
 /* Sends Read TOC/PMA/ATIP command to read TOC, check & display errors and return the success state. */
-BOOL verified_read_TOC(HANDLE hVolume,
+driver_return_code_t verified_read_TOC(CdIo_t *p_cdio,
                        unsigned long int data_buffer_size)
 {
-    BOOL success;
+    driver_return_code_t success;
     unsigned short int alloc_len=0;
 
     printf("Sending read TOC command..");
     //Sends MMC1 READ TOC/PMA/ATIP command to drive to get 4 byte header.
-    success=read_TOC_PMA_ATIP(hVolume, 0, 0, 4);
-    if(success)
+    success=read_TOC_PMA_ATIP(p_cdio, 0, 0, 4);
+    if(success==DRIVER_OP_SUCCESS)
     {
-        if(sptd_sb.sptd.ScsiStatus==STATUS_GOOD)
-        {
-            alloc_len=data_buf[0] << 8;
-            alloc_len=alloc_len | data_buf[1];
-        }
-        else
-        {
-            success=FALSE;
-            printf("done.\n");
-            if(sptd_sb.sptd.ScsiStatus==STATUS_CHKCOND)
-            {
-                disp_sense();
-            }
-            else
-            {
-                printf("Command sent but returned with an unhandled status code: %02X\n", sptd_sb.sptd.ScsiStatus);
-            }
-        }
+        alloc_len=data_buf[0] << 8;
+        alloc_len=alloc_len | data_buf[1];
     }
     else
     {
-        printf("failed.\n");
-        printf("Could not return 4 byte Read TOC header.\n");
+        printf("done.\n");
+        if(success==DRIVER_OP_MMC_SENSE_DATA)
+        {
+            disp_sense(p_cdio);
+        }
+        else
+        {
+            printf("Command sent but returned with an unhandled status code: %02X\n", success);
+        }
     }
 
-    if(success && (alloc_len>0))
+    if(success==DRIVER_OP_SUCCESS && (alloc_len>0))
     {
         //Limit alloc len to maximum allowed by size of data transfer buffer length.
         if((alloc_len+2)>data_buffer_size)
@@ -541,43 +374,39 @@ BOOL verified_read_TOC(HANDLE hVolume,
         }
 
         //Sends MMC1 READ TOC/PMA/ATIP command to drive to get full data.
-        success=read_TOC_PMA_ATIP(hVolume, 0, 0, alloc_len+2);
-        if(success)
+        success=read_TOC_PMA_ATIP(p_cdio, 0, 0, alloc_len+2);
+        printf("done.\n");
+        if(success==DRIVER_OP_SUCCESS)
         {
-            printf("done.\n");
-            if(sptd_sb.sptd.ScsiStatus==STATUS_GOOD)
-            {
-                alloc_len=data_buf[0] << 8;
-                alloc_len=alloc_len | data_buf[1];
-            }
-            else
-            {
-                success=FALSE;
-                if(sptd_sb.sptd.ScsiStatus==STATUS_CHKCOND)
-                {
-                    disp_sense();
-                }
-                else
-                {
-                    printf("Command sent but returned with an unhandled status code: %02X\n", sptd_sb.sptd.ScsiStatus);
-                }
-            }
+            alloc_len=data_buf[0] << 8;
+            alloc_len=alloc_len | data_buf[1];
         }
         else
         {
-            printf("failed.\n");
-            printf("Could only return 4 byte Read TOC header.\n");
+            if(success==DRIVER_OP_MMC_SENSE_DATA)
+            {
+                disp_sense(p_cdio);
+            }
+            else
+            {
+                printf("Command sent but returned with an unhandled status code: %02X\n", success);
+            }
         }
+    }
+    else
+    {
+        printf("failed.\n");
+        printf("Could only return 4 byte Read TOC header.\n");
     }
 
     return success;
 }
 
 /* Sends Test Unit Ready command 3 times, check for errors & display error info. */
-BOOL verified_test_unit_ready3(HANDLE hVolume)
+driver_return_code_t verified_test_unit_ready3(CdIo_t *p_cdio)
 {
     unsigned char i=3;
-    BOOL success;
+    driver_return_code_t success;
 
     /*
     Before sending the required command, here we clear any pending sense info from the drive
@@ -587,33 +416,23 @@ BOOL verified_test_unit_ready3(HANDLE hVolume)
     {
         printf("Sending SPC1 Test Unit CDB6 command..");
         //Sends SPC1 Test Unit Ready command to drive
-        success=test_unit_ready(hVolume);
-        if(success)
+        success=test_unit_ready(p_cdio);
+        printf("done.\n");
+        if(success==DRIVER_OP_SUCCESS)
         {
-            printf("done.\n");
-            if(sptd_sb.sptd.ScsiStatus==STATUS_GOOD)
-            {
-                printf("Returned good status.\n");
-                i=1;
-            }
-            else
-            {
-                if(sptd_sb.sptd.ScsiStatus==STATUS_CHKCOND)
-                {
-                    disp_sense();
-                }
-                else
-                {
-                    printf("Command sent but returned with an unhandled status code: %02X\n", sptd_sb.sptd.ScsiStatus);
-                }
-
-                success=FALSE;
-            }
+            printf("Returned good status.\n");
+            i=1;
         }
         else
         {
-            printf("failed.\n");
-            printf("DeviceIOControl returned with failed status.\n");
+            if(success==DRIVER_OP_MMC_SENSE_DATA)
+            {
+                disp_sense(p_cdio);
+            }
+            else
+            {
+                printf("Command sent but returned with an unhandled status code: %02X\n", success);
+            }
         }
         i--;
     }while(i>0);
@@ -622,7 +441,7 @@ BOOL verified_test_unit_ready3(HANDLE hVolume)
 }
 
 //Find lead-out from read TOC data.
-BOOL find_leadout_from_TOC(unsigned char *data_buf,
+bool find_leadout_from_TOC(unsigned char *data_buf,
                            unsigned char &out_n_tracks,
                            unsigned long int &out_n_sectors)
 {
@@ -630,12 +449,12 @@ BOOL find_leadout_from_TOC(unsigned char *data_buf,
     unsigned long int sector;
     unsigned short int alloc_len;
     unsigned short int TOC_response_data_len;
-    BOOL found_leadout;
+    bool found_leadout;
 
     alloc_len=data_buf[0] << 8;
     alloc_len=alloc_len | data_buf[1];
     TOC_response_data_len=alloc_len+2;
-    found_leadout=FALSE;
+    found_leadout=false;
     out_n_tracks=0;
     //Iterate thru TOC entries to find track 0xAA (leadout track)..
     for(i=4;i<TOC_response_data_len;i=i+8)
@@ -672,7 +491,7 @@ BOOL find_leadout_from_TOC(unsigned char *data_buf,
 
                     out_n_tracks--;  //Don't include this track.
 
-                    found_leadout=TRUE;
+                    found_leadout=true;
                 }
 
                 out_n_tracks++;
@@ -687,10 +506,11 @@ BOOL find_leadout_from_TOC(unsigned char *data_buf,
 Main loop of reading the CD and writing to image file.
 Various error checking are also done here.
 */
-BOOL read_cd_to_image(char drive_letter, char *file_pathname, unsigned short int x_speed, unsigned long int data_buffer_size)
+bool read_cd_to_image(char *drive_letter, char *file_pathname, unsigned short int x_speed, unsigned long int data_buffer_size)
 {
-    HANDLE hVolume;
-    BOOL success;
+    CdIo_t *p_cdio;
+    bool cmd_ret;
+    driver_return_code_t success;
     unsigned char n_tracks;  //Total tracks.
     unsigned long int n_sectors;  //Total sectors on CD.
     FILE *file_ptr;
@@ -699,22 +519,22 @@ BOOL read_cd_to_image(char drive_letter, char *file_pathname, unsigned short int
     unsigned long int n_sectors_to_read;  //No. of sectors to read per read command.
     unsigned short int speed_kbytes;  //Write speed in kbytes.
 
-    hVolume = open_volume(drive_letter);
-    if (hVolume != INVALID_HANDLE_VALUE)
+    p_cdio = open_volume(drive_letter);
+    if (p_cdio != NULL)
     {
         printf("\n");
-        success=verified_test_unit_ready3(hVolume);
+        success=verified_test_unit_ready3(p_cdio);
         printf("\n");
-        if(success)
+        if(success==DRIVER_OP_SUCCESS)
         {
             //Get TOC from CD.
-            success=verified_read_TOC(hVolume, data_buffer_size);
-            if(success)
+            success=verified_read_TOC(p_cdio, data_buffer_size);
+            if(success==DRIVER_OP_SUCCESS)
             {
                 if(find_leadout_from_TOC(data_buf, n_tracks, n_sectors))
                 {
                     printf("Total user tracks : %u\n", n_tracks);
-                    printf("Total sectors     : %u\n", n_sectors);
+                    printf("Total sectors     : %lu\n", n_sectors);
 
                     //Do we need to set CD speed?
                     if(x_speed!=0)
@@ -730,14 +550,15 @@ BOOL read_cd_to_image(char drive_letter, char *file_pathname, unsigned short int
                         }
 
                         //Attempt to set the cd read speed to specified and write speed to max.
-                        success=verified_set_cd_speed(hVolume, speed_kbytes, 0xFFFF);
+                        success=verified_set_cd_speed(p_cdio, speed_kbytes, 0xFFFF);
                     }
-                    else
+// claunia: no need for this
+/*                    else
                     {
                         //No need to set CD speed.
-                        success=TRUE;
-                    }
-                    if(success)
+                        success=true;
+                    }*/
+                    if(success==DRIVER_OP_SUCCESS)
                     {
                         file_ptr=fopen(file_pathname, "wb");
                         if(file_ptr!=NULL)
@@ -754,87 +575,104 @@ BOOL read_cd_to_image(char drive_letter, char *file_pathname, unsigned short int
                                 }
 
                                 LBA_i2=LBA_i+n_sectors_to_read-1;
-                                printf("Reading sector %u to %u (total: %u, progress: %.1f%%)\n", LBA_i, LBA_i2, n_sectors, (double)LBA_i2/n_sectors*100);
-                                if(read_cd_2048(hVolume, LBA_i, n_sectors_to_read, 0))
+                                printf("Reading sector %lu to %lu (total: %lu, progress: %.1f%%)\n", LBA_i, LBA_i2, n_sectors, (double)LBA_i2/n_sectors*100);
+                                if(read_cd_2048(p_cdio, LBA_i, n_sectors_to_read, 0)==DRIVER_OP_SUCCESS)
                                 {
-                                    if(sptd_sb.sptd.ScsiStatus==STATUS_GOOD)
+                                    if(success==DRIVER_OP_SUCCESS)
                                     {
                                         fwrite(data_buf, 2048*n_sectors_to_read, 1, file_ptr);
                                         if(ferror(file_ptr))
                                         {
                                             printf("Write file error!\n");
                                             printf("Aborting process.\n");
-                                            success=FALSE;
+                                            cmd_ret=false;
                                             break;  //Stop while loop.
                                         }
                                     }
                                     else
                                     {
-                                        if(sptd_sb.sptd.ScsiStatus==STATUS_CHKCOND)
+                                        if(success==DRIVER_OP_MMC_SENSE_DATA)
                                         {
-                                            disp_sense();
+                                            disp_sense(p_cdio);
                                         }
                                         else
                                         {
-                                            printf("Command sent but returned with an unhandled status code: %02X\n", sptd_sb.sptd.ScsiStatus);
+                                            printf("Command sent but returned with an unhandled status code: %02X\n", success);
                                         }
 
                                         printf("Aborting process.\n");
-                                        success=FALSE;
                                         break;  //Stop while loop.
                                     } 
                                 }
+                                else
+                                {
+                                    if(success==DRIVER_OP_MMC_SENSE_DATA)
+                                    {
+                                        disp_sense(p_cdio);
+                                    }
+                                    else
+                                    {
+                                        printf("Command sent but returned with an unhandled status code: %02X\n", success);
+                                    }
+
+                                    printf("Aborting process.\n");
+                                    break;  //Stop while loop.
+                                } 
 
                                 LBA_i=LBA_i+n_sectors_to_read;
                             }
 
                             fclose(file_ptr);
+                            cmd_ret=true;
                         }
                         else
                         {
                             printf("Could not create file!\n");
                             printf("Aborting process.\n");
-                            success=FALSE;
+                            cmd_ret = false;
                         }
                     }
                     else
                     {
                         printf("Could not set read speed!\n");
                         printf("Aborting process.\n");
+                        cmd_ret = false;
                     }
                 }
                 else
                 {
                     printf("Could not find lead-out entry in TOC to determine total sectors on CD!\n");
                     printf("Aborting process.\n");
-                    success=FALSE;
+                    cmd_ret = false;
                 }
             }
             else
             {
                 printf("Could not read TOC!\n");
                 printf("Aborting process.\n");
+                cmd_ret = false;
             }
         }
         else
         {
             printf("Drive is not ready!\n");
             printf("Aborting process.\n");
+            cmd_ret = false;
         }
 
-        CloseHandle(hVolume);  //Win32 function.
+        cdio_destroy(p_cdio);  //Win32 function.
     }
     else
     {
-        return FALSE;
+        return false;
     }
 
-    return success;
+    return cmd_ret;
 }
 
 void usage()
 {
-    printf("CDToImg v1.01. 22 Oct 2006.\n");
+    printf("CDToImg v1.02. 13 Oct 2013.\n");
     printf("Usage: cdtoimg <drive letter> <output file> [x read speed]\n");
     printf("x speed is one of the following:\n");
     printf("  - Enter CD x speed value.\n");
@@ -867,7 +705,7 @@ int main(int argc, char *argv[])
                 x_speed=atoi(argv[3]);  //Use specified write speed.
             }
         }
-        if(read_cd_to_image(argv[1][0], argv[2], x_speed, 65536))
+        if(read_cd_to_image(argv[1], argv[2], x_speed, 65536))
         {
             printf("Process finished.");
         }
@@ -877,8 +715,8 @@ int main(int argc, char *argv[])
         }
 
         free(data_buf);
-
-	return 0;
+        
+        return 0;
     }
     else
     {

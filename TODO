@@ -1,0 +1,6 @@
+Move source files to src folder.
+Output binaries to obj folder.
+Create autoconf, to check libcdio is present on system.
+Check with MinGW.
+Check if compilable with VisualC++.
+Make it use D8 command.
