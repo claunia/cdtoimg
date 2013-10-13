@@ -1,9 +1,7 @@
-CDToImg v1.01.
-09 Oct 2006.
+CDToImg v1.02.
+13 Oct 2013.
 Written by Truman (My alias club.cdfreaks.com forum name).
-
-Language and type: MS Visual Studio .NET 2002, Visual C++ v7, mixed C and C++,
-Application type : Win32 console.
+Modified by Natalia Portillo <natalia@claunia.com>
 
 A program that reads an entire CD-ROM (mode 1 or mode 2 form 1) 2048 bytes per
 sector and writes to a file - this would be an .ISO file. The CD must be CD-ROM
@@ -21,22 +19,15 @@ As always I do not take any responsibilities if this tool destroys your drive or
 even anything else.
 
 This code uses:
-- Win32 IOCTL function with SCSI_PASS_THROUGH_DIRECT.
+- libcdio as to cross-platform-esque send MMC commands to CD/DVD/BD drives.
 - The SCSI codes used in this source were taken from the draft documents MMC1.
   SPC1 and SAM1.
 - MMC1 Read CD command (0xBE, CDB 12) to read sectors (2048 user bytes mode).
 - Determine errors, retrieve and decode a few sense data.
 
-You normally need the ntddscsi.h file from Microsoft DDK CD, but I shouldn't
-distribute it, so instead I have written my own my_ntddscsi.h.
+You need to have libcdio, development headers, to compile, and binary library to use.
 
-If you don't have windows.h some of the define constants are listed as comments.
-
-This is a Win32 console program and only runs in a DOS prompt under Windows
-NT4/2K/XP/2003 with appropriate user rights, i.e. you need to log in as
-administrator.
-
-cdtoimg <drive letter> <outputfile> [x read speed]
+cdtoimg <drive path> <outputfile> [x read speed]
 x speed is one of the following:
   - Enter CD x speed value.
   - Ommit or enter 0 to use currently set speed.
@@ -86,9 +77,15 @@ Hardware tested to be working
 - Plextor 8432T
 - Plextor 755A
 - LG GCR-8485B
+- LG GH20NS15
 
 History
 -------
+v1.02 - 13 Oct 2013
+- Moved code to libcdio.
+- Created basic UNIX Makefile.
+- No dependences on VisualC++, Windows DKK or Windows SDK.
+
 v1.01 - 22 Oct 2006
 - Fixed some small silly bugs.
 
